@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "front": "virtual_machine:block/screen_desktop",
+    "side": "virtual_machine:block/case_side",
+    "top": "virtual_machine:block/case_top"
+  }
+}

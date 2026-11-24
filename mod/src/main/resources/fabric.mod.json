@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "virtual_machine",
+  "version": "${version}",
+  "name": "PC Craft · 可装机电脑",
+  "description": "一台能插 ISO 光盘 / IMG 软盘镜像、自己装系统、开机进桌面的电脑。",
+  "authors": ["AutoMods"],
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "cn.blockforge.generated.virtualmachine.VirtualMachineMod"
+    ],
+    "client": [
+      "cn.blockforge.generated.virtualmachine.VirtualMachineClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

@@ -15,9 +15,13 @@ import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -33,6 +37,12 @@ public final class LocalVm {
     private record QemuTools(Path system, Path image) {
     }
 
+    /** CD-ROM 热插拔使用的 QEMU 设备编号。 */
+    private static final String CDROM_ID = "pc-craft-cdrom";
+    /** 开机就接上一个空的可热插拔 IDE 光驱，运行中可用 QMP 换盘。 */
+    private static final List<String> CDROM_COMMAND = List.of("-drive",
+        "if=none,id=" + CDROM_ID + ",media=cdrom", "-device", "ide-cd,drive=" + CDROM_ID);
+
     private volatile Session active;
     private volatile String status = "选择 ISO / IMG 安装系统，或从本机虚拟硬盘启动。";
 
@@ -43,6 +53,15 @@ public final class LocalVm {
         volatile RfbConnection display;
         volatile Socket socket;
         volatile ServerSocket listener;
+        // 热插拔状态：当前挂在光驱里的镜像（已保证位于虚拟机目录内），以及待处理的换盘请求。
+        volatile Path mountedMedia;
+        volatile Path pendingMedia;
+        volatile Runnable mediaCallback;
+        // 运行线程在处理换盘时置位，避免重复入队启动多个处理线程。
+        volatile boolean handlingMedia;
+        // 虚拟机工作目录与本次会话产生的临时镜像副本（换盘复制出来的需要退出时清理）。
+        volatile Path vmDirectory;
+        final Deque<Path> temporaryMedia = new ArrayDeque<>();
     }
 
     private LocalVm() {
@@ -71,6 +90,12 @@ public final class LocalVm {
         return session == null ? null : session.display;
     }
 
+    /** 当前挂在虚拟机光驱里的镜像；没有运行或空盘时返回 null。 */
+    Path mountedMedia() {
+        Session session = active;
+        return session == null ? null : session.mountedMedia;
+    }
+
     synchronized boolean start(Path directory, Path media) {
         if (active != null) {
             return false;
@@ -80,6 +105,143 @@ public final class LocalVm {
         active = session;
         Thread.ofVirtual().name("PC-Craft-VM").start(() -> run(session, directory, media));
         return true;
+    }
+
+    /**
+     * 虚拟机运行中热换光盘：弹出旧盘、插入新 ISO（null 表示只弹出）。
+     * 请求排队到 QEMU 进程线程执行，完成后回调 {@code done}（游戏线程外）。
+     */
+    void swapCd(Path iso, Runnable done) {
+        Session session = active;
+        Process process = session == null ? null : session.process;
+        if (session == null || session.stopping || process == null || !process.isAlive()) {
+            return;
+        }
+        synchronized (session) {
+            session.pendingMedia = iso;
+            session.mediaCallback = done;
+            if (session.handlingMedia) {
+                return;
+            }
+            session.handlingMedia = true;
+        }
+        Thread.ofVirtual().name("PC-Craft-VM-media").start(() -> handleMediaRequests(session));
+    }
+
+    private void handleMediaRequests(Session session) {
+        while (!session.stopping) {
+            Path requested;
+            Runnable callback;
+            synchronized (session) {
+                if (session.pendingMedia == null && session.mediaCallback == null) {
+                    session.handlingMedia = false;
+                    return;
+                }
+                requested = session.pendingMedia;
+                callback = session.mediaCallback;
+                session.pendingMedia = null;
+                session.mediaCallback = null;
+            }
+            String result;
+            try {
+                result = changeCd(session, requested);
+            } catch (IOException | RuntimeException ex) {
+                result = "无法更换光盘：" + ex.getMessage();
+            }
+            status = result;
+            if (callback != null) {
+                callback.run();
+            }
+        }
+    }
+
+    /** 弹出旧 ISO，把新 ISO 挂进 IDE 光驱。传 null 表示只弹出。 */
+    private String changeCd(Session session, Path iso) throws IOException {
+        Process process = session.process;
+        if (process == null || !process.isAlive()) {
+            throw new IOException("虚拟机没有在运行。");
+        }
+        Path previous = session.mountedMedia;
+        if (previous != null) {
+            Map<String, Object> eject = new LinkedHashMap<>();
+            eject.put("device", CDROM_ID);
+            eject.put("force", true);
+            if (!sendQmp(process, "eject", eject)) {
+                throw new IOException("QEMU 拒绝弹出旧光盘。");
+            }
+            session.mountedMedia = null;
+        }
+        if (iso == null) {
+            return "已弹出光盘，光驱现在是空的。";
+        }
+        // 热插拔只支持 ISO 光盘；IMG（软盘/硬盘安装盘）需要重启才能换。
+        String extension = validateMedia(iso);
+        if (!extension.equals(".iso")) {
+            throw new IOException("运行中只能热换 .iso 光盘；软盘 / 硬盘镜像请关机后重新选择。");
+        }
+        Path target = ensureLocalMedia(session, iso);
+        Map<String, Object> drive = new LinkedHashMap<>();
+        drive.put("file", qemuMediaPath(session.vmDirectory, target).toString().replace("\\", "/"));
+        drive.put("format", "raw");
+        Map<String, Object> insert = new LinkedHashMap<>();
+        insert.put("device", CDROM_ID);
+        insert.put("driver", "ide-cd");
+        insert.put("id", CDROM_ID + "-media");
+        insert.put("image", drive);
+        if (!sendQmp(process, "blockdev-insert-medium", insert)) {
+            throw new IOException("QEMU 拒绝插入新光盘，请确认文件仍可读且是 .iso。");
+        }
+        session.mountedMedia = target;
+        return "已热插拔换上新的光盘。";
+    }
+
+    /** 把要挂载的镜像准备好：必要时复制进虚拟机目录并用短文件名引用。 */
+    private static Path ensureLocalMedia(Session session, Path media) throws IOException {
+        Path vmDirectory = session.vmDirectory;
+        Path absolute = media.toAbsolutePath();
+        if (vmDirectory.equals(absolute.getParent())) {
+            return absolute;
+        }
+        if (!WINDOWS) {
+            return absolute;
+        }
+        // Windows 路径过长或含非 ASCII 字符时，QEMU 可能打不开，复制一份短名副本。
+        if (!needsSafeMediaName(vmDirectory, absolute)) {
+            return absolute;
+        }
+        status = "正在准备安装镜像的临时副本…";
+        Path temporary = Files.createTempFile(vmDirectory, "installer-", ".iso");
+        try {
+            copyMedia(session, absolute, temporary);
+        } catch (IOException ex) {
+            Files.deleteIfExists(temporary);
+            throw ex;
+        }
+        session.temporaryMedia.offerLast(temporary);
+        return temporary;
+    }
+
+    /** 开机镜像的校验与复制：ISO 记录为待热插拔，IMG 返回要直接接线的路径。 */
+    private Path prepareBootMedia(Session session, Path media) throws IOException {
+        String extension = validateMedia(media);
+        if (!extension.equals(".iso")) {
+            return media;
+        }
+        // Windows 路径过长或含非 ASCII 字符时，QEMU 可能打不开，先复制一份短名副本。
+        if (WINDOWS && needsSafeMediaName(session.vmDirectory, media)) {
+            status = "正在准备安装镜像的临时副本…";
+            Path temporary = Files.createTempFile(session.vmDirectory, "installer-", extension);
+            try {
+                copyMedia(session, media, temporary);
+            } catch (IOException ex) {
+                Files.deleteIfExists(temporary);
+                throw ex;
+            }
+            session.temporaryMedia.offerLast(temporary);
+            media = temporary;
+        }
+        session.pendingMedia = media;
+        return null;
     }
 
     void powerButton() {
@@ -107,8 +269,8 @@ public final class LocalVm {
 
     private void run(Session session, Path directory, Path media) {
         directory = directory.toAbsolutePath();
+        session.vmDirectory = directory;
         Path log = directory.resolve("qemu.log");
-        Path temporaryMedia = null;
         String result;
         try (ServerSocket listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
             session.listener = listener;
@@ -117,14 +279,8 @@ public final class LocalVm {
             QemuTools tools = findQemu(directory, needsDisk);
             Files.createDirectories(directory);
             if (media != null) {
-                media = media.toAbsolutePath();
-                String extension = validateMedia(media);
-                if (WINDOWS && needsSafeMediaName(directory, media)) {
-                    status = "正在准备安装镜像的临时副本…";
-                    temporaryMedia = Files.createTempFile(directory, "installer-", extension);
-                    copyMedia(session, media, temporaryMedia);
-                    media = temporaryMedia;
-                }
+                // 开机镜像统一走热插拔的挂载流程：校验、必要时复制短名副本、记录为当前光盘。
+                media = prepareBootMedia(session, media);
             }
             if (session.stopping) {
                 return;
@@ -153,6 +309,8 @@ public final class LocalVm {
                 }
                 session.display = new RfbConnection(socket);
                 status = "正在读取系统的画面…";
+                // 开机时带的 ISO 会先以空光驱启动、再热插拔进 ide-cd，保证运行中可以随时换盘。
+                startCdHotplug(session);
                 session.display.run();
             }
             result = "虚拟机已关闭。";
@@ -167,18 +325,37 @@ public final class LocalVm {
             result = "无法准备虚拟机：" + ex.getMessage();
         } finally {
             endGuest(session.process);
-            if (temporaryMedia != null) {
-                try {
-                    Files.deleteIfExists(temporaryMedia);
-                } catch (IOException ex) {
-                    temporaryMedia.toFile().deleteOnExit();
-                }
-            }
+            deleteTemporaryMedia(session);
             if (session.stopping) {
                 finish(session, "虚拟机已关闭。");
             }
         }
         finish(session, result);
+    }
+
+    /** 开机镜像改用 QMP 热插拔挂进空光驱；失败则退回提示，虚拟机仍从硬盘启动。 */
+    private void startCdHotplug(Session session) {
+        Path boot = session.mountedMedia;
+        if (boot == null) {
+            return;
+        }
+        session.mountedMedia = null;
+        try {
+            changeCd(session, boot);
+        } catch (IOException | RuntimeException ex) {
+            status = "光盘挂载失败：" + ex.getMessage() + " 虚拟机将继续从硬盘启动。";
+        }
+    }
+
+    private static void deleteTemporaryMedia(Session session) {
+        Path copy;
+        while ((copy = session.temporaryMedia.pollFirst()) != null) {
+            try {
+                Files.deleteIfExists(copy);
+            } catch (IOException ex) {
+                copy.toFile().deleteOnExit();
+            }
+        }
     }
 
     private synchronized void finish(Session session, String result) {
@@ -251,21 +428,25 @@ public final class LocalVm {
 
     private static List<String> mediaOptions(Path directory, Path media) throws IOException {
         if (media == null) {
-            return List.of("-boot", "order=c,menu=on");
+            // 没有直接接线的镜像时，也预留一个空的可热插拔 IDE 光驱（盘符 D:）。
+            return List.of(CDROM_COMMAND, "-boot", "order=c,menu=on");
         }
         String name = media.getFileName().toString().toLowerCase(Locale.ROOT);
         String file = "file=" + escape(qemuMediaPath(directory, media)) + ",format=raw";
         if (name.endsWith(".iso")) {
+            // 正常不会走到这里：开机 ISO 已改由 QMP 热插拔挂载。保底仍按传统方式接线。
             return List.of("-drive", file + ",if=ide,index=2,media=cdrom,readonly=on",
                 "-boot", "order=c,once=d,menu=on");
         }
         long size = Files.size(media);
         if (size == 368640 || size == 737280 || size == 1228800 || size == 1474560 || size == 2949120) {
-            return List.of("-drive", file + ",if=floppy,readonly=on", "-boot", "order=c,once=a,menu=on");
+            return List.of("-drive", file + ",if=floppy,readonly=on", CDROM_COMMAND,
+                "-boot", "order=c,once=a,menu=on");
         }
         // 硬盘型 IMG 的写入落到临时副本，系统请安装到另一块持久硬盘。
         return List.of("-drive", file + ",if=none,id=installer,snapshot=on",
-            "-device", "ide-hd,drive=installer,bus=ide.0,unit=1,bootindex=1", "-boot", "menu=on");
+            "-device", "ide-hd,drive=installer,bus=ide.0,unit=1,bootindex=1", CDROM_COMMAND,
+            "-boot", "menu=on");
     }
 
     private static Process launchGuest(Path disk, List<String> media, int port, Path log, Path emulator) throws IOException {
